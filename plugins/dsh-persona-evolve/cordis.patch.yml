@@ -1,0 +1,58 @@
+# Bundle patch for dsh-persona-evolve.
+#
+# The row must live in the host layer: it owns the pre-step listener that
+# buffers learning candidates and the loader row it remounts when a confirmed
+# persona delta has to reach sessions that are already running.
+- insert:
+    - id: persona-evolve
+      name: 'dsh-persona-evolve'
+      config:
+        # Master switch. false = observe nothing, call no model, touch no file.
+        enabled: true
+
+        # Settings entry id that carries the persona card. The default reuses
+        # dsh-cosplay's row so this plugin never introduces a second persona.
+        entryId: 'cosplay-core'
+
+        # Role id inside that entry whose card fields are allowed to evolve.
+        roleId: 'dafeiyu'
+
+        # Card fields the learner may propose deltas for. Anything else
+        # (name/description/system_prompt/first_mes/...) stays human-owned.
+        editableSections:
+          - style
+          - rules
+          - behavior
+
+        # Learning funnel: zero-LLM prescreen per turn, one batch call when the
+        # candidate buffer reaches this many entries or this many characters.
+        batchSize: 8
+        batchTokenThreshold: 1200
+
+        # false = every suggested delta waits for an explicit confirm.
+        trustMode: false
+
+        # Agent presets to rebind after a persona change (comma-free list of
+        # preset ids). Leave empty when the persona is carried by a settings
+        # entry, as dsh-cosplay does.
+        presets: []
+
+        # Model used for the batched learning call (never per turn).
+        learnProvider: 'deepseek'
+        learnModel: 'deepseek-chat'
+        learnMaxTokens: 800
+
+        # Short-term memory refresh cadence (turns) and long-term promotion
+        # threshold (turns of accumulated short-term memory).
+        shortTermEveryTurns: 2
+        longTermPromoteTurns: 20
+        longTermUseLlm: true
+
+        # Token budget of the read-only persona digest tool.
+        digestTokens: 200
+
+        # Empty = $DSH_HOME/persona-evolve.
+        dataDir: ''
+
+        # Empty = built-in prescreen rules.
+        rules: []

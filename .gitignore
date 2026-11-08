@@ -1,0 +1,7 @@
+# 只上传插件源码；其余（运维手册、脚本、临时文件、凭据）不进仓库。
+*
+!.gitignore
+!README.md
+!plugins/
+!plugins/dsh-persona-evolve/
+!plugins/dsh-persona-evolve/**
