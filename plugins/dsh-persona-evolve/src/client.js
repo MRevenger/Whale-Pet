@@ -2,7 +2,7 @@
  * dsh-persona-evolve — 浏览器侧（dsh.client 声明，包入口 dsh-persona-evolve/client）。
  *
  * 设置页新增「人设演化」页，四个分区：
- *   人设版本 / 短期记忆 / 长期记忆 / 学习规则。
+ *   人设版本 / 短期记忆 / 长期记忆 / 判读与回落。
  *
  * 0.2.x 客户端三条硬约束（与 dsh-cosplay 同源）：
  *   1. 参数 codec 必须是 strict 且带 create() 工厂；result 可用 src-json。
@@ -248,11 +248,11 @@ window.__ModuleLoader__.load({
         React.createElement('div', { key: 'path', style: styles.hint }, `明文文件：${longTerm.path ?? ''}`),
       ]
 
-      const rulesTab = [
+      const judgeTab = [
         React.createElement(
           'div',
-          { style: styles.card, key: 'rules' },
-          React.createElement('div', { style: styles.title }, '学习开关'),
+          { style: styles.card, key: 'judge' },
+          React.createElement('div', { style: styles.title }, '判读开关'),
           React.createElement('div', { style: styles.row },
             React.createElement('button', {
               style: overview?.enabled ? styles.buttonPrimary : styles.button,
@@ -260,12 +260,12 @@ window.__ModuleLoader__.load({
               onClick: () => act(() => store.mutate((remote) => remote.setFlags({ enabled: !overview?.enabled }))),
             }, overview?.enabled ? '已开启 · 点击关闭' : '已关闭 · 点击开启'),
             React.createElement('button', {
-              style: overview?.trustMode ? styles.buttonPrimary : styles.button,
+              style: overview?.autoApply ? styles.buttonPrimary : styles.button,
               disabled: busy,
-              onClick: () => act(() => store.mutate((remote) => remote.setFlags({ trustMode: !overview?.trustMode }))),
-            }, overview?.trustMode ? '信任模式：开（自动应用）' : '信任模式：关（需确认）'),
+              onClick: () => act(() => store.mutate((remote) => remote.setFlags({ autoApply: !overview?.autoApply }))),
+            }, overview?.autoApply ? '自动生效：开（对话里直接改）' : '自动生效：关（先存草稿）'),
           ),
-          React.createElement('div', { style: styles.hint }, '预筛规则与批量阈值在插件配置（cordis.patch.yml 的 persona-evolve 行）里修改：batchSize 默认 8，batchTokenThreshold 默认 1200；普通闲聊不会触发模型调用。'),
+          React.createElement('div', { style: styles.hint }, '没有任何关键词规则：每攒满 batchSize 轮（默认 6），模型自己读这几轮对话，判断要不要调整说话方式。判为不用就不落任何改动；判为要改就写卡 + 留版本快照 + 热重载。改错了用 persona_rollback 回上一版。'),
         ),
         React.createElement('div', { key: 'status', style: styles.card },
           React.createElement('div', { style: styles.title }, '运行状态'),
@@ -280,10 +280,10 @@ window.__ModuleLoader__.load({
           tabButton('versions', '人设版本'),
           tabButton('short', '短期记忆'),
           tabButton('long', '长期记忆'),
-          tabButton('rules', '学习规则'),
+          tabButton('judge', '判读与回落'),
         ),
         snapshot.error ? React.createElement('div', { style: styles.hint }, `提示：${snapshot.error}`) : null,
-        ...(tab === 'versions' ? versionsTab : tab === 'short' ? shortTermTab : tab === 'long' ? longTermTab : rulesTab),
+        ...(tab === 'versions' ? versionsTab : tab === 'short' ? shortTermTab : tab === 'long' ? longTermTab : judgeTab),
       )
     }
 

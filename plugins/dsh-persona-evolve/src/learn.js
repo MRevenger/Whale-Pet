@@ -1,8 +1,11 @@
 /**
- * dsh-persona-evolve — 批量学习器（低频 LLM）。
+ * dsh-persona-evolve — 对话判读器（低频 LLM）。
  *
- * 硬约束：这里**只在**候选缓冲达到阈值时被调用一次，且每次只能看到候选片段与
- * 人设里允许微调的字段（不是全量人设），max_tokens 由配置卡在 800。
+ * 设计（v2）：不再用关键词预筛决定“值不值得学”。每一批 N 轮真实对话交给模型
+ * 自己判读：主人的话里有没有对“怎么说话 / 怎么做”的反馈。模型说不该学，就
+ * 什么都不发生；说该学，才产出小幅 delta。
+ *
+ * 硬约束：每次调用只能看到最近 N 轮对话与少数可变字段，max_tokens ≤ 800；
  * 输出必须是严格 JSON；解析失败就当没学到东西，不猜、不重试轰炸模型。
  */
 
@@ -16,34 +19,51 @@ const CARD_FIELD_LABELS = {
   system_prompt: '系统提示',
 }
 
-/** 单次学习允许的最大改动条数（防止一次重写整张卡）。 */
-const MAX_DELTAS = 3
+/** 单次判读允许的最大改动条数（防止一次重写整张卡）。 */
+const MAX_DELTAS = 2
 /** 单条 delta 的字符增量上限：超过视为重写而非微调。 */
 const MAX_DELTA_GROWTH = 160
 
-export function buildLearnPrompt({ candidates, card, editable }) {
+/**
+ * 构造判读提示。
+ * @param {object} input
+ * @param {Array<{turn:number,text:string}>} input.turns - 最近 N 轮主人说的话。
+ * @param {object} input.card - 当前角色卡。
+ * @param {string[]} input.editable - 允许微调的字段。
+ * @param {string} [input.styleNote] - 上一版微调的备注，用于避免来回摇摆。
+ */
+export function buildLearnPrompt({ turns, card, editable, styleNote }) {
   const sections = editable.filter((field) => CARD_FIELD_LABELS[field])
   const current = sections
     .map((field) => `【${field}｜${CARD_FIELD_LABELS[field]}】\n${String(card[field] ?? '（空）').slice(0, 400)}`)
     .join('\n\n')
-  const snippets = candidates
-    .map((candidate, index) => `${index + 1}. [${candidate.reasons.join('/')}] ${candidate.text.slice(0, 300)}`)
+  const dialogue = (turns ?? [])
+    .map((item, index) => `${index + 1}. 主人：${String(item.text ?? '').slice(0, 300)}`)
     .join('\n')
 
   const system = [
-    '你是人设维护器，只做小幅、可验证的微调，不重写人格。',
-    '输入是「用户最近的候选片段」与「当前人设里允许微调的字段」。',
-    '只输出一个 JSON 对象，不要代码块、不要解释文字。',
-    'JSON 结构：{"should_learn": boolean, "reason": string, "deltas": [{"section": string, "after": string, "reason": string}]}',
-    `规则：section 只能是 ${sections.join(' / ')} 之一；最多 ${MAX_DELTAS} 条 delta；`,
-    'after 必须是该字段修改后的完整文本（不是补丁），且与原文相比只是局部调整；',
-    '没有足够证据就 should_learn=false、deltas=[]，reason 写一句话。',
+    '你在维护一个聊天机器人的人设。给你「主人最近说的话」和「当前人设里允许微调的字段」。',
+    '任务：判断这段时间里，主人有没有对「它该怎么说话、该怎么做事」表达过要求或示范。',
+    '',
+    '判断口径：',
+    '- 只有涉及表达方式、语气、称呼、口头禅、句式、主动性、边界的内容才算；',
+    '- 普通提问、闲聊、让干活、吐槽别人、聊游戏剧情，都不算——should_learn=false；',
+    '- 主人明确纠正或提出要求（哪怕语气很随意）算；主人自己示范了想要的说话方式也算；',
+    '- 一次只能改一点点：最多 1–2 条，每条是整段替换后的文本，长度增量不超过 160 字；',
+    '- 宁可少改也不要猜：证据不足就 false；不要顺手“优化”没被提到的字段。',
+    '',
+    '只输出一个 JSON 对象，不要代码块、不要解释文字：',
+    '{"should_learn": boolean, "reason": string, "evidence": [string], "deltas": [{"section": string, "after": string, "reason": string}]}',
+    `section 只能是 ${sections.join(' / ')} 之一；evidence 里引用主人的原话，每条不超过 60 字。`,
   ].join('\n')
 
   const user = [
     `## 当前人设（仅可微调字段）\n${current || '（无可微调字段）'}`,
-    `## 候选片段\n${snippets || '（无）'}`,
-  ].join('\n\n')
+    styleNote ? `## 上一版微调\n${styleNote}` : '',
+    `## 主人最近说的话\n${dialogue || '（无）'}`,
+  ]
+    .filter((part) => part !== '')
+    .join('\n\n')
 
   return { system, user }
 }
@@ -65,17 +85,20 @@ export function extractJsonObject(text) {
 }
 
 /**
- * 校验并规整学习结果。
+ * 校验并规整判读结果。
  * @param {unknown} parsed - extractJsonObject 的结果。
  * @param {object} card - 当前角色卡。
  * @param {string[]} editable - 允许修改的字段。
- * @returns {{should_learn: boolean, reason: string, deltas: Array}} 规整后的结果。
+ * @returns {{should_learn: boolean, reason: string, evidence: string[], deltas: Array}} 规整后的结果。
  */
 export function normalizeLearnResult(parsed, card, editable) {
-  const empty = { should_learn: false, reason: 'no-valid-result', deltas: [] }
+  const empty = { should_learn: false, reason: 'no-valid-result', evidence: [], deltas: [] }
   if (parsed === null || typeof parsed !== 'object') return empty
   const reason = typeof parsed.reason === 'string' ? parsed.reason.slice(0, 200) : ''
-  if (parsed.should_learn !== true) return { should_learn: false, reason: reason || 'declined', deltas: [] }
+  const evidence = Array.isArray(parsed.evidence)
+    ? parsed.evidence.filter((item) => typeof item === 'string' && item.trim() !== '').map((item) => item.slice(0, 120)).slice(0, 3)
+    : []
+  if (parsed.should_learn !== true) return { should_learn: false, reason: reason || 'declined', evidence, deltas: [] }
   if (!Array.isArray(parsed.deltas)) return empty
 
   const deltas = []
@@ -96,7 +119,7 @@ export function normalizeLearnResult(parsed, card, editable) {
     })
     if (deltas.length >= MAX_DELTAS) break
   }
-  return { should_learn: deltas.length > 0, reason: reason || 'learned', deltas }
+  return { should_learn: deltas.length > 0, reason: reason || 'learned', evidence, deltas }
 }
 
 export function buildLongTermPrompt({ summary, keyFacts, openQuestions }) {

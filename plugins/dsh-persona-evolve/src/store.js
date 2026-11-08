@@ -47,7 +47,7 @@ export async function readText(path) {
 
 export async function writeTextAtomic(path, text) {
   await mkdir(dirname(path), { recursive: true })
-  const tmp = `${path}.tmp-${process.pid}-${Date.now()}`
+  const tmp = `${path}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
   await writeFile(tmp, text, 'utf8')
   await rename(tmp, path)
 }

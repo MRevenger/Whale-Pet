@@ -16,7 +16,7 @@ import Schema from '@deepseek-ai/schemastery'
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import { composeEntries, readProfilePatches } from '@deepseek-ai/dsh-app-boot'
 import * as store from './store.js'
-import { compileRules, inspect, messageText, roughTokens, DEFAULT_RULES } from './prescreen.js'
+import { messageText } from './text.js'
 import {
   buildLearnPrompt,
   buildLongTermPrompt,
@@ -38,7 +38,7 @@ export const Config = Schema.object({
   roleId: Schema.string().default('dafeiyu'),
   editableSections: Schema.array(Schema.string()).default(['style', 'rules', 'behavior']),
   batchSize: Schema.number().default(8),
-  batchTokenThreshold: Schema.number().default(1200),
+  autoApply: Schema.boolean().default(true),
   trustMode: Schema.boolean().default(false),
   presets: Schema.array(Schema.string()).default([]),
   learnProvider: Schema.string().default('deepseek'),
@@ -48,14 +48,8 @@ export const Config = Schema.object({
   longTermPromoteTurns: Schema.number().default(20),
   longTermUseLlm: Schema.boolean().default(true),
   digestTokens: Schema.number().default(200),
+  pendingNotice: Schema.boolean().default(true),
   dataDir: Schema.string().default(''),
-  rules: Schema.array(
-    Schema.object({
-      id: Schema.string().default(''),
-      label: Schema.string().default(''),
-      pattern: Schema.string().default(''),
-    }),
-  ).default([]),
 })
 
 /** 0.2.x 把每个 volatile 字段单独包成带 `.get()` 的引用，逐层解包。 */
@@ -84,7 +78,7 @@ function plainConfig(config) {
       ? pick('editableSections', []).map(String)
       : ['style', 'rules', 'behavior'],
     batchSize: Math.max(1, Number(pick('batchSize', 8)) || 8),
-    batchTokenThreshold: Math.max(100, Number(pick('batchTokenThreshold', 1200)) || 1200),
+    autoApply: pick('autoApply', pick('trustMode', true)) !== false,
     trustMode: pick('trustMode', false) === true,
     presets: Array.isArray(pick('presets', [])) ? pick('presets', []).map(String) : [],
     learnProvider: String(pick('learnProvider', 'deepseek')),
@@ -94,8 +88,8 @@ function plainConfig(config) {
     longTermPromoteTurns: Math.max(4, Number(pick('longTermPromoteTurns', 20)) || 20),
     longTermUseLlm: pick('longTermUseLlm', true) !== false,
     digestTokens: Math.max(60, Number(pick('digestTokens', 200)) || 200),
+    pendingNotice: pick('pendingNotice', true) !== false,
     dataDir: String(pick('dataDir', '')),
-    rules: Array.isArray(pick('rules', [])) ? pick('rules', []) : [],
   }
 }
 
@@ -337,8 +331,6 @@ async function callModel(ctx, cfg, system, user, maxTokens) {
  */
 export function apply(ctx, config) {
   const paths = store.layout(store.resolveDataDir(plainConfig(config)))
-  let rules = compileRules(plainConfig(config).rules)
-  let rulesSource = JSON.stringify(plainConfig(config).rules)
 
   /** 每会话的观察缓冲；进程内即可，落盘的是摘要与 delta。 */
   const buffers = new Map()
@@ -374,7 +366,7 @@ export function apply(ctx, config) {
   function bufferOf(sessionId) {
     let buffer = buffers.get(sessionId)
     if (buffer === undefined) {
-      buffer = { candidates: [], turns: [], lastTurn: -1, tokens: 0, learning: false }
+      buffer = { pending: [], turns: [], lastTurn: -1, learning: false }
       buffers.set(sessionId, buffer)
     }
     return buffer
@@ -413,12 +405,19 @@ export function apply(ctx, config) {
     ready = true
   }
 
-  async function persistState() {
-    await store.writeJsonAtomic(paths.state, {
-      revision,
-      counters,
-      updatedAt: new Date().toISOString(),
-    })
+  let stateWrite = Promise.resolve()
+  function persistState() {
+    // 串行化：pre-step 里每轮都会触发，并发写同一个文件会互相 rename 掉。
+    stateWrite = stateWrite
+      .then(() =>
+        store.writeJsonAtomic(paths.state, {
+          revision,
+          counters,
+          updatedAt: new Date().toISOString(),
+        }),
+      )
+      .catch((error) => warn('保存状态失败', error))
+    return stateWrite
   }
 
   // ── A：版本与备份 ─────────────────────────────────────────────────────────
@@ -428,6 +427,7 @@ export function apply(ctx, config) {
     const markdown = [`<!-- revision v${next} · ${new Date().toISOString()} · ${note} -->`, '', renderCardMarkdown(role)].join('\n')
     const path = `${paths.revisions}/v${next}.md`
     await store.writeTextAtomic(path, markdown)
+    await store.writeJsonAtomic(`${paths.revisions}/v${next}.json`, { revision: next, note, role })
     revision = next
     await store.writeJsonAtomic(paths.current, {
       revision: next,
@@ -534,15 +534,80 @@ export function apply(ctx, config) {
     return { revision: next, role, reload }
   }
 
+  /** 上一版微调的备注，喂给判读器避免来回摇摆。 */
+  async function lastRevisionNote() {
+    try {
+      const current = await store.readJson(paths.current, undefined)
+      return typeof current?.note === 'string' ? current.note.slice(0, 120) : ''
+    } catch {
+      return ''
+    }
+  }
+
+  /** 把人设回滚到指定版本（默认上一版）。回滚本身也会生成一个新版本。 */
+  async function rollbackTo(revisionLabel) {
+    const config = cfg()
+    const files = await store.listFiles(paths.revisions)
+    const versions = files
+      .map((file) => /^v(\d+)\.json$/.exec(file.name))
+      .filter((match) => match !== null)
+      .map((match) => Number(match[1]))
+      .sort((a, b) => a - b)
+    if (versions.length === 0) throw new Error('persona-evolve: 还没有任何版本可回滚')
+    let target
+    if (revisionLabel === undefined || revisionLabel === '') {
+      target = versions.length >= 2 ? versions[versions.length - 2] : versions[0]
+    } else {
+      const wanted = Number(String(revisionLabel).replace(/^v/i, ''))
+      if (!versions.includes(wanted)) throw new Error(`persona-evolve: 没有 revision v${wanted}`)
+      target = wanted
+    }
+    const snapshot = await store.readJson(`${paths.revisions}/v${target}.json`, undefined)
+    if (snapshot === undefined || snapshot.role === undefined) {
+      throw new Error(`persona-evolve: revision v${target} 缺少 JSON 快照`)
+    }
+    const fields = [
+      'name',
+      'emoji',
+      'description',
+      'personality',
+      'scenario',
+      'system_prompt',
+      'post_history_instructions',
+      'style',
+      'rules',
+      'behavior',
+      'first_mes',
+      'mes_example',
+      'creator_notes',
+      'character_version',
+      'creator',
+      'tags',
+    ]
+    const patch = {}
+    for (const field of fields) {
+      if (snapshot.role[field] !== undefined) patch[field] = snapshot.role[field]
+    }
+    const role = await writeCard(ctx, config, patch)
+    const next = await snapshotRevision(role, `回滚到 v${target}`)
+    try {
+      await reloadPersona(ctx, config)
+      counters.lastReloadAt = new Date().toISOString()
+    } catch (error) {
+      warn('回滚后热重载失败（新会话仍会读到旧人设）', error)
+    }
+    await persistState()
+    console.log(`[persona-evolve] 已回滚到 v${target}，生成 revision v${next}`)
+    return { from: target, revision: next }
+  }
+
   // ── 学习：候选缓冲 → 一次批量调用 ─────────────────────────────────────────
   async function learnNow(sessionId) {
     const buffer = bufferOf(sessionId)
-    if (buffer.learning || buffer.candidates.length === 0) return
     const config = cfg()
+    if (buffer.learning || buffer.pending.length < config.batchSize) return
     buffer.learning = true
-    const batch = buffer.candidates.slice(0, config.batchSize)
-    buffer.candidates = buffer.candidates.slice(batch.length)
-    buffer.tokens = buffer.candidates.reduce((sum, item) => sum + item.tokens, 0)
+    const batch = buffer.pending.splice(0, config.batchSize)
     try {
       let role
       try {
@@ -551,7 +616,12 @@ export function apply(ctx, config) {
         warn('读取角色卡失败，跳过本轮学习', error)
         return
       }
-      const prompt = buildLearnPrompt({ candidates: batch, card: role, editable: config.editableSections })
+      const prompt = buildLearnPrompt({
+        turns: batch,
+        card: role,
+        editable: config.editableSections,
+        styleNote: await lastRevisionNote(),
+      })
       counters.learnCalls += 1
       const reply = await callModel(ctx, config, prompt.system, prompt.user, config.learnMaxTokens)
       if (process.env.PE_DEBUG) console.warn('[persona-evolve] learn raw:', String(reply).slice(0, 600))
@@ -563,10 +633,10 @@ export function apply(ctx, config) {
         await persistState()
         return
       }
-      if (config.trustMode) {
+      if (config.autoApply) {
         const applied = await applyDeltas(
           result.deltas,
-          `自动应用（信任模式）· ${result.reason}`,
+          `对话判读 · ${result.reason}`,
           sessionId,
         )
         await store.appendJsonl(paths.deltas, {
@@ -575,9 +645,13 @@ export function apply(ctx, config) {
           sessionId,
           sections: result.deltas.map((delta) => delta.section),
           reason: result.reason,
+          evidence: result.evidence ?? [],
           status: 'auto-applied',
           revision: applied.revision,
         })
+        console.log(
+          `[persona-evolve] 悄然微调 ${result.deltas.map((delta) => delta.section).join('/')}（${result.reason}）`,
+        )
       } else {
         await recordSuggested(result.deltas, sessionId, result.reason)
       }
@@ -592,14 +666,14 @@ export function apply(ctx, config) {
   function scheduleLearn(sessionId) {
     const config = cfg()
     const buffer = bufferOf(sessionId)
-    const shouldLearn = buffer.candidates.length >= config.batchSize || buffer.tokens >= config.batchTokenThreshold
-    if (!shouldLearn) return
+    if (buffer.learning || buffer.pending.length < config.batchSize) return
     const previous = learnQueue.get(sessionId) ?? Promise.resolve()
     const next = previous.then(() => learnNow(sessionId)).catch((error) => warn('学习队列异常', error))
     learnQueue.set(sessionId, next)
   }
 
   // ── 观察：pre-step 里只做零成本的事 ───────────────────────────────────────
+  // v2：不预筛关键词。每轮只把主人的话记进缓冲，攒够 batchSize 轮交给模型判读。
   function observe(payload) {
     const config = cfg()
     if (!config.enabled) return
@@ -608,32 +682,25 @@ export function apply(ctx, config) {
     // 子代理的提示词不是主人的话，混进来会污染人设：只跟根会话。
     if (agent.parent !== undefined && agent.parent !== null) return
     const sessionId = String(agent.session?.id ?? agent.id ?? 'unknown')
-    // 同一个回合可能被多个 step 触发 pre-step：只按第一步计轮，避免重复计入候选。
+    // 同一个回合可能被多个 step 触发 pre-step：只按第一步计轮。
     if (Number(payload.step ?? 1) > 1) return
     const turn = Number(payload.turn ?? 0)
     const buffer = bufferOf(sessionId)
     const messages = Array.isArray(payload.messages) ? payload.messages : []
     const texts = messages.map(messageText).filter((text) => text.trim() !== '')
     if (texts.length === 0) return
-    const joined = texts.join('\n')
-    const current = JSON.stringify(config.rules)
-    if (current !== rulesSource) {
-      rulesSource = current
-      rules = compileRules(config.rules)
-    }
-    const seen = inspect(joined, rules)
+    const joined = texts.join('\n').slice(0, 600)
     buffer.turns.push({ turn, role: 'user', text: joined })
     if (buffer.turns.length > 40) buffer.turns = buffer.turns.slice(-40)
-    if (seen.hit) {
-      buffer.candidates.push({ turn, text: seen.text.slice(0, 600), reasons: seen.reasons, tokens: roughTokens(seen.text) })
-      buffer.tokens += roughTokens(seen.text)
-      counters.candidates += 1
-    }
     if (turn !== buffer.lastTurn) {
       buffer.lastTurn = turn
       counters.turnsObserved += 1
+      // 每轮都进待判读缓冲；攒够 batchSize 才让模型看一眼，平时一次都不调用。
+      buffer.pending.push({ turn, text: joined })
+      if (buffer.pending.length > 24) buffer.pending = buffer.pending.slice(-24)
       const every = config.shortTermEveryTurns
       if (counters.turnsObserved % every === 0) void refreshShortTerm(sessionId, buffer)
+      void persistState().catch((error) => warn('保存状态失败', error))
     }
     scheduleLearn(sessionId)
   }
@@ -709,15 +776,15 @@ export function apply(ctx, config) {
 
   function statusText() {
     const config = cfg()
-    const buffered = [...buffers.values()].reduce((sum, buffer) => sum + buffer.candidates.length, 0)
+    const buffered = [...buffers.values()].reduce((sum, buffer) => sum + buffer.pending.length, 0)
     return [
       `persona-evolve：${config.enabled ? '开启' : '关闭'}`,
       `人设：${config.entryId}/${config.roleId} · revision v${revision}`,
-      `学习：${counters.learnCalls} 次批量调用 · 观察 ${counters.turnsObserved} 轮 · 候选 ${counters.candidates} 条（缓冲 ${buffered}）`,
+      `判读：${counters.learnCalls} 次低频调用 · 观察 ${counters.turnsObserved} 轮 · 待判读 ${buffered} 轮`,
       `长期记忆：${counters.longTermCalls} 次提炼调用`,
       `最近学习：${counters.lastLearnAt || '—'}`,
       `最近重载：${counters.lastReloadAt || '—'}`,
-      `信任模式：${config.trustMode ? '开' : '关'}`,
+      `微调方式：${config.autoApply ? '模型判读后自动生效（可回滚）' : '先建议、等确认'}`,
       counters.lastError === '' ? '' : `最近错误：${counters.lastError}`,
     ].filter((line) => line !== '').join('\n')
   }
@@ -825,6 +892,23 @@ export function apply(ctx, config) {
     })
 
     ctx.tools.register({
+      name: 'persona_rollback',
+      description: '把人设回滚到某个历史版本；不传 revision 就回到上一版。回滚本身也会留一个版本快照。',
+      parameters: {
+        type: 'object',
+        properties: {
+          revision: { type: 'string', description: '目标版本号，如 v3；留空表示上一版。' },
+        },
+        additionalProperties: false,
+      },
+      output: textOutput,
+      async execute(args) {
+        const result = await rollbackTo(args?.revision)
+        return `已回滚到 v${result.from}，当前为 revision v${result.revision}。`
+      },
+    })
+
+    ctx.tools.register({
       name: 'persona_memory_confirm',
       description: '把一条「待确认」的长期记忆移入正式区，之后模型才能在对话中看到它。',
       parameters: {
@@ -858,6 +942,7 @@ export function apply(ctx, config) {
       }
       return {
         enabled: config.enabled,
+        autoApply: config.autoApply,
         trustMode: config.trustMode,
         entryId: config.entryId,
         roleId: config.roleId,
@@ -928,10 +1013,11 @@ export function apply(ctx, config) {
     async setFlags(patch) {
       const next = {}
       if (typeof patch?.enabled === 'boolean') next.enabled = patch.enabled
+      if (typeof patch?.autoApply === 'boolean') next.autoApply = patch.autoApply
       if (typeof patch?.trustMode === 'boolean') next.trustMode = patch.trustMode
       if (Object.keys(next).length > 0) await ctx.settings.update(name, next)
       const config = cfg()
-      return { enabled: config.enabled, trustMode: config.trustMode }
+      return { enabled: config.enabled, autoApply: config.autoApply }
     }
     async reloadNow() {
       const result = await reloadPersona(ctx, cfg())
@@ -1020,12 +1106,50 @@ export function apply(ctx, config) {
     })
   }
 
+  // ── 待确认提示：让模型知道「确认」二字指的是什么 ──────────────────────────
+  let pendingCache = { at: 0, rows: [] }
+  async function pendingRows() {
+    const now = Date.now()
+    if (now - pendingCache.at < 5000) return pendingCache.rows
+    const rows = await store.readJsonl(paths.deltas)
+    pendingCache = { at: now, rows: rows.filter((row) => row.status === 'suggested') }
+    return pendingCache.rows
+  }
+
+  async function attachPendingNotice(payload) {
+    const config = cfg()
+    if (!config.enabled || config.autoApply || config.pendingNotice === false) return
+    if (Number(payload?.step ?? 1) > 1) return
+    const messages = Array.isArray(payload?.messages) ? payload.messages : []
+    const last = messages[messages.length - 1]
+    if (last === undefined || last.role !== 'user') return
+    const blocks = Array.isArray(last.content) ? last.content : []
+    if (blocks.some((block) => typeof block?.text === 'string' && block.text.includes('[persona-evolve] 待确认'))) return
+    const pending = await pendingRows()
+    if (pending.length === 0) return
+    const brief = pending
+      .slice(0, 3)
+      .map((row) => `${row.id}/${row.section}`)
+      .join('、')
+    const text =
+      `[persona-evolve] 待确认的人设调整 ${pending.length} 条：${brief}。` +
+      '用户表示同意就用 persona_delta_confirm 逐条确认，表示反对就用 persona_delta_reject；' +
+      '只有本轮确实在谈这件事时才提一句，不要主动展开细节。'
+    blocks.push({ type: 'text', text })
+    last.content = blocks
+  }
+
   // ── 装配 ─────────────────────────────────────────────────────────────────
   ctx.on('agent/pre-step', async (payload, next) => {
     try {
       observe(payload)
     } catch (error) {
       warn('pre-step 观察失败', error)
+    }
+    try {
+      await attachPendingNotice(payload)
+    } catch (error) {
+      warn('待确认提示注入失败', error)
     }
     return next()
   })
@@ -1046,7 +1170,7 @@ export function apply(ctx, config) {
 
   void bootstrap()
     .then(() => {
-      console.log(`[persona-evolve] 已启用（${paths.root}）· 规则 ${rules.length} 条 · 人设 ${cfg().entryId}/${cfg().roleId} · 批量 ${cfg().batchSize}`)
+      console.log(`[persona-evolve] 已启用（${paths.root}）· 人设 ${cfg().entryId}/${cfg().roleId} · 每 ${cfg().batchSize} 轮判读一次 · ${cfg().autoApply ? '自动生效' : '等确认'}`)
     })
     .catch((error) => warn('初始化失败', error))
 }

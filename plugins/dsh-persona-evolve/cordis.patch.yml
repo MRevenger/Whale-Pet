@@ -1,8 +1,8 @@
 # Bundle patch for dsh-persona-evolve.
 #
 # The row must live in the host layer: it owns the pre-step listener that
-# buffers learning candidates and the loader row it remounts when a confirmed
-# persona delta has to reach sessions that are already running.
+# buffers the owner's turns and the loader row it remounts when a persona
+# change has to reach sessions that are already running.
 - insert:
     - id: persona-evolve
       name: 'dsh-persona-evolve'
@@ -17,27 +17,32 @@
         # Role id inside that entry whose card fields are allowed to evolve.
         roleId: 'dafeiyu'
 
-        # Card fields the learner may propose deltas for. Anything else
+        # Card fields the judge may change. Anything else
         # (name/description/system_prompt/first_mes/...) stays human-owned.
         editableSections:
           - style
           - rules
           - behavior
 
-        # Learning funnel: zero-LLM prescreen per turn, one batch call when the
-        # candidate buffer reaches this many entries or this many characters.
-        batchSize: 8
-        batchTokenThreshold: 1200
+        # No keyword gate. Every turn goes into a small pending buffer; once
+        # this many turns are queued, one small model call reads them and
+        # decides whether the speaking style should shift at all.
+        batchSize: 6
 
-        # false = every suggested delta waits for an explicit confirm.
-        trustMode: false
+        # true = a judged change is written to the card, snapshotted and hot
+        # reloaded right away (rollback with persona_rollback).
+        # false = the change is stored as a suggestion and waits for a confirm.
+        autoApply: true
 
-        # Agent presets to rebind after a persona change (comma-free list of
-        # preset ids). Leave empty when the persona is carried by a settings
-        # entry, as dsh-cosplay does.
+        # Injected only when autoApply is false: tells the model that pending
+        # suggestions exist and which tool confirms them.
+        pendingNotice: true
+
+        # Agent presets to rebind after a persona change. Leave empty when the
+        # persona is carried by a settings entry, as dsh-cosplay does.
         presets: []
 
-        # Model used for the batched learning call (never per turn).
+        # Model used for the batched judge call (never per turn).
         learnProvider: 'deepseek'
         learnModel: 'deepseek-chat'
         learnMaxTokens: 800
@@ -53,6 +58,3 @@
 
         # Empty = $DSH_HOME/persona-evolve.
         dataDir: ''
-
-        # Empty = built-in prescreen rules.
-        rules: []
